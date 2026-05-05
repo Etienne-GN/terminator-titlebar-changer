@@ -180,24 +180,43 @@ class TitlebarChanger(plugin.MenuItem):
         self._apply_titlebar_modify(titlebar_widget, override)
 
     def _apply_titlebar_modify(self, titlebar_widget, override):
-        """Set inline modify_bg/modify_fg so we beat Terminator's own."""
+        """Set inline modify_bg/modify_fg so we beat Terminator's own.
+
+        Terminator paints two distinct widgets in Titlebar.update():
+          * the outer Titlebar (an EventBox)         -> via self.modify_bg
+          * the inner group menu (self.ebox)         -> via self.ebox.modify_bg
+          * the group label (self.grouplabel)        -> via modify_fg
+        Both bg widgets must be overridden, otherwise the small group menu
+        on the left of each pane keeps Terminator's grey while the rest of
+        the titlebar gets our color.
+        """
         try:
+            ebox       = getattr(titlebar_widget, 'ebox',       None)
+            label      = getattr(titlebar_widget, 'label',      None)
+            grouplabel = getattr(titlebar_widget, 'grouplabel', None)
             if override is not None:
                 bg_hex, fg_hex = override
                 if bg_hex:
                     color = Gdk.color_parse(bg_hex)
                     if color is not None:
                         titlebar_widget.modify_bg(Gtk.StateType.NORMAL, color)
+                        if ebox is not None:
+                            ebox.modify_bg(Gtk.StateType.NORMAL, color)
                 if fg_hex:
                     color = Gdk.color_parse(fg_hex)
-                    label = getattr(titlebar_widget, 'label', None)
-                    if color is not None and label is not None:
-                        label.modify_fg(Gtk.StateType.NORMAL, color)
+                    if color is not None:
+                        if label is not None:
+                            label.modify_fg(Gtk.StateType.NORMAL, color)
+                        if grouplabel is not None:
+                            grouplabel.modify_fg(Gtk.StateType.NORMAL, color)
             else:
                 titlebar_widget.modify_bg(Gtk.StateType.NORMAL, None)
-                label = getattr(titlebar_widget, 'label', None)
+                if ebox is not None:
+                    ebox.modify_bg(Gtk.StateType.NORMAL, None)
                 if label is not None:
                     label.modify_fg(Gtk.StateType.NORMAL, None)
+                if grouplabel is not None:
+                    grouplabel.modify_fg(Gtk.StateType.NORMAL, None)
         except Exception as exc:
             err('TitlebarChanger: modify_bg/fg failed: %s' % exc)
 
