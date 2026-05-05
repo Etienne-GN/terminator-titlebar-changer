@@ -22,9 +22,10 @@
 
 import re
 
-from gi.repository import Gtk, Gdk, GObject
+from gi.repository import Gtk, Gdk, GObject, GLib
 
 import terminatorlib.plugin as plugin
+import terminatorlib.titlebar as _titlebar_module
 from terminatorlib.config import Config
 from terminatorlib.terminator import Terminator
 from terminatorlib.translation import _
@@ -36,6 +37,8 @@ AVAILABLE = ['TitlebarChanger']
 
 TARGET_TITLEBAR = 'titlebar'
 TARGET_WINDOW   = 'window'
+
+PROFILE_POLL_MS = 1000
 
 # ─── colour helpers ──────────────────────────────────────────────────────────
 
@@ -72,35 +75,131 @@ class TitlebarChanger(plugin.MenuItem):
 
     _class_serial = 0  # incremented per widget to create a unique CSS class
 
-    rules             = None  # list of rule dicts
-    target            = None  # TARGET_TITLEBAR or TARGET_WINDOW
-    watched           = None  # set of Terminal objects
-    handler_ids       = None  # Terminal → [(obj, signal_id), …]
-    terminal_override = None  # Terminal → (bg_hex, fg_hex) | None
-    window_class      = None  # GtkWindow → str  (unique CSS class)
-    window_provider   = None  # GtkWindow → Gtk.CssProvider
-    tb_class          = None  # Terminal → str  (unique CSS class for titlebar)
-    tb_provider       = None  # Terminal → Gtk.CssProvider
+    rules               = None  # list of rule dicts
+    target_titlebar     = None  # bool — color the per-pane titlebar
+    target_window       = None  # bool — color the OS window title bar
+    window_follow_focus = None  # bool — window color tracks focused pane
+    follow_profile      = None  # bool — fall back to profile colors
+    watched             = None  # set of Terminal objects
+    handler_ids         = None  # Terminal → [(obj, signal_id), …]
+    terminal_override   = None  # Terminal → (bg_hex, fg_hex) | None
+    window_class        = None  # GtkWindow → str  (unique CSS class)
+    window_provider     = None  # GtkWindow → Gtk.CssProvider
+    tb_class            = None  # Terminal → str  (unique CSS class for titlebar)
+    tb_provider         = None  # Terminal → Gtk.CssProvider
+    poll_timer          = None  # GLib source id for the always-on tick
+    focused_terminal    = None  # GtkWindow → Terminal currently focused
+
+    # Class-level state for the Titlebar.update monkey-patch. Terminator's
+    # Titlebar.update() calls modify_bg/modify_fg on each focus change, which
+    # are inline widget-style overrides that *beat* any CSS provider. We patch
+    # update() once so we can re-apply our colors after Terminator paints.
+    _patched      = False
+    _instances    = []
+    _orig_update  = None
 
     def __init__(self):
         plugin.MenuItem.__init__(self)
-        self.rules             = []
-        self.target            = TARGET_WINDOW
-        self.watched           = set()
-        self.handler_ids       = {}
-        self.terminal_override = {}
-        self.window_class      = {}
-        self.window_provider   = {}
-        self.tb_class          = {}
-        self.tb_provider       = {}
+        self.rules               = []
+        self.target_titlebar     = False
+        self.target_window       = True
+        self.window_follow_focus = False
+        self.follow_profile      = False
+        self.watched             = set()
+        self.handler_ids         = {}
+        self.terminal_override   = {}
+        self.window_class        = {}
+        self.window_provider     = {}
+        self.tb_class            = {}
+        self.tb_provider         = {}
+        self.poll_timer          = None
+        self.focused_terminal    = {}
         self._load_config()
+        TitlebarChanger._install_titlebar_patch(self)
         self._update_watched()
+        # Plugin __init__ may run before the initial terminals appear in
+        # Terminator().terminals — sweep again once the main loop spins.
+        GLib.idle_add(self._initial_sweep)
+        # Always-on tick: discovers terminals created later AND, in
+        # follow-profile mode, picks up profile changes and late-arriving
+        # profile colors (terminal.config can be empty right after creation).
+        self._start_poll()
 
     def unload(self):
+        self._stop_poll()
         for terminal in list(self.watched):
             self._unwatch_terminal(terminal)
         self._clear_all_window_css()
         self._clear_all_titlebar_css()
+        TitlebarChanger._uninstall_titlebar_patch(self)
+
+    # ── Titlebar.update monkey-patch (class-level) ────────────────────────────
+
+    @classmethod
+    def _install_titlebar_patch(cls, instance):
+        if instance not in cls._instances:
+            cls._instances.append(instance)
+        if cls._patched:
+            return
+        cls._orig_update = _titlebar_module.Titlebar.update
+
+        def _patched_update(this_self, other=None):
+            cls._orig_update(this_self, other)
+            for inst in list(cls._instances):
+                try:
+                    inst._post_titlebar_update(this_self)
+                except Exception as exc:
+                    err('TitlebarChanger: post-update hook failed: %s' % exc)
+
+        _titlebar_module.Titlebar.update = _patched_update
+        cls._patched = True
+
+    @classmethod
+    def _uninstall_titlebar_patch(cls, instance):
+        try:
+            cls._instances.remove(instance)
+        except ValueError:
+            pass
+        if cls._instances or not cls._patched:
+            return
+        if cls._orig_update is not None:
+            _titlebar_module.Titlebar.update = cls._orig_update
+            cls._orig_update = None
+        cls._patched = False
+
+    def _post_titlebar_update(self, titlebar_widget):
+        """Re-apply our color after Terminator's update() ran modify_bg."""
+        if not self.target_titlebar:
+            return
+        terminal = getattr(titlebar_widget, 'terminal', None)
+        if terminal is None or terminal not in self.watched:
+            return
+        override = self.terminal_override.get(terminal)
+        if override is None:
+            return  # let Terminator's own colors stand
+        self._apply_titlebar_modify(titlebar_widget, override)
+
+    def _apply_titlebar_modify(self, titlebar_widget, override):
+        """Set inline modify_bg/modify_fg so we beat Terminator's own."""
+        try:
+            if override is not None:
+                bg_hex, fg_hex = override
+                if bg_hex:
+                    color = Gdk.color_parse(bg_hex)
+                    if color is not None:
+                        titlebar_widget.modify_bg(Gtk.StateType.NORMAL, color)
+                if fg_hex:
+                    color = Gdk.color_parse(fg_hex)
+                    label = getattr(titlebar_widget, 'label', None)
+                    if color is not None and label is not None:
+                        label.modify_fg(Gtk.StateType.NORMAL, color)
+            else:
+                titlebar_widget.modify_bg(Gtk.StateType.NORMAL, None)
+                label = getattr(titlebar_widget, 'label', None)
+                if label is not None:
+                    label.modify_fg(Gtk.StateType.NORMAL, None)
+        except Exception as exc:
+            err('TitlebarChanger: modify_bg/fg failed: %s' % exc)
 
     # ── config ───────────────────────────────────────────────────────────────
 
@@ -112,10 +211,24 @@ class TitlebarChanger(plugin.MenuItem):
             old = cfg.plugin_get_config('TitleReact')
             if isinstance(old, dict):
                 sections = old
-        self.target = TARGET_WINDOW
+        self.target_titlebar     = False
+        self.target_window       = True
+        self.window_follow_focus = False
+        self.follow_profile      = False
         if isinstance(sections, dict):
-            t = sections.get('target', TARGET_WINDOW)
-            self.target = TARGET_TITLEBAR if t == TARGET_TITLEBAR else TARGET_WINDOW
+            truthy = lambda v: str(v).lower() in ('1', 'true', 'yes', 'on')
+            if 'target_titlebar' in sections or 'target_window' in sections:
+                self.target_titlebar = truthy(sections.get('target_titlebar', False))
+                self.target_window   = truthy(sections.get('target_window',   False))
+            else:
+                # Migrate single-target schema (target = 'titlebar' | 'window')
+                t = sections.get('target', TARGET_WINDOW)
+                self.target_titlebar = (t == TARGET_TITLEBAR)
+                self.target_window   = (t != TARGET_TITLEBAR)
+            if not (self.target_titlebar or self.target_window):
+                self.target_window = True
+            self.window_follow_focus = truthy(sections.get('window_follow_focus', False))
+            self.follow_profile      = truthy(sections.get('follow_profile',      False))
         self.rules = []
         if not isinstance(sections, dict):
             return
@@ -137,12 +250,22 @@ class TitlebarChanger(plugin.MenuItem):
                 'fg_color': item.get('fg_color', ''),
                 'enabled':  bool(item.get('enabled', True)),
             })
-        dbg('TitlebarChanger: loaded %d rule(s), target=%s' % (len(self.rules), self.target))
+        dbg('TitlebarChanger: loaded %d rule(s), titlebar=%s window=%s '
+            'follow_focus=%s follow_profile=%s'
+            % (len(self.rules), self.target_titlebar, self.target_window,
+               self.window_follow_focus, self.follow_profile))
 
     def _save_config(self):
         cfg = Config()
         cfg.plugin_del_config(self.__class__.__name__)
-        cfg.plugin_set(self.__class__.__name__, 'target', self.target)
+        cfg.plugin_set(self.__class__.__name__,
+                       'target_titlebar', self.target_titlebar)
+        cfg.plugin_set(self.__class__.__name__,
+                       'target_window', self.target_window)
+        cfg.plugin_set(self.__class__.__name__,
+                       'window_follow_focus', self.window_follow_focus)
+        cfg.plugin_set(self.__class__.__name__,
+                       'follow_profile', self.follow_profile)
         for i, rule in enumerate(self.rules):
             cfg.plugin_set(self.__class__.__name__,
                            'rule_%d' % i,
@@ -184,6 +307,9 @@ class TitlebarChanger(plugin.MenuItem):
             except Exception:
                 pass
         self.terminal_override.pop(terminal, None)
+        for win, t in list(self.focused_terminal.items()):
+            if t is terminal:
+                self.focused_terminal.pop(win, None)
         self.watched.discard(terminal)
 
     # ── signal handlers ───────────────────────────────────────────────────────
@@ -197,9 +323,10 @@ class TitlebarChanger(plugin.MenuItem):
         return False
 
     def _on_focus_in(self, terminal, *_args):
-        if self.target == TARGET_WINDOW:
-            window = terminal.get_toplevel()
-            if isinstance(window, Gtk.Window):
+        window = terminal.get_toplevel()
+        if isinstance(window, Gtk.Window):
+            self.focused_terminal[window] = terminal
+            if self.target_window:
                 self._update_window(window)
         return False
 
@@ -210,6 +337,7 @@ class TitlebarChanger(plugin.MenuItem):
     # ── rule matching ─────────────────────────────────────────────────────────
 
     def _check_and_set(self, terminal, title):
+        # Rules always have priority — they override the profile color.
         match = None
         for rule in self.rules:
             if not rule.get('enabled', True):
@@ -223,15 +351,63 @@ class TitlebarChanger(plugin.MenuItem):
                     break
             except re.error as exc:
                 err('TitlebarChanger: bad regex %r – %s' % (pattern, exc))
+        if match is None and self.follow_profile:
+            match = self._profile_override(terminal)
         self.terminal_override[terminal] = match
+
+    # ── profile-follow mode ───────────────────────────────────────────────────
+
+    def _profile_override(self, terminal):
+        """Return (bg_hex, fg_hex) read from the terminal's active profile,
+        or None if neither color is available."""
+        try:
+            cfg = terminal.config
+            bg = (cfg['background_color'] or '').strip()
+            fg = (cfg['foreground_color'] or '').strip()
+        except Exception:
+            return None
+        if not bg and not fg:
+            return None
+        return (bg, fg)
+
+    def _initial_sweep(self):
+        self._update_watched()
+        return False  # one-shot
+
+    def _start_poll(self):
+        if self.poll_timer is None:
+            self.poll_timer = GLib.timeout_add(PROFILE_POLL_MS,
+                                               self._poll_tick)
+
+    def _stop_poll(self):
+        if self.poll_timer is not None:
+            try:
+                GLib.source_remove(self.poll_timer)
+            except Exception:
+                pass
+            self.poll_timer = None
+
+    def _poll_tick(self):
+        # Discover terminals that appeared since the last tick.
+        self._update_watched()
+        # In follow-profile mode, re-evaluate every watched terminal so we
+        # pick up both profile swaps (e.g. ProfileSwitcher) and the case
+        # where profile colors weren't ready at watch-time.
+        if self.follow_profile:
+            for terminal in list(self.watched):
+                old = self.terminal_override.get(terminal)
+                self._check_and_set(terminal, terminal.get_window_title() or '')
+                if self.terminal_override.get(terminal) != old:
+                    self._dispatch_update(terminal)
+        return True
 
     # ── dispatch ──────────────────────────────────────────────────────────────
 
     def _dispatch_update(self, terminal):
-        """Route the update to the right target (titlebar or window)."""
-        if self.target == TARGET_TITLEBAR:
+        """Update whichever target(s) are enabled."""
+        if self.target_titlebar:
             self._apply_titlebar_css(terminal, self.terminal_override.get(terminal))
-        else:
+        if self.target_window:
             window = terminal.get_toplevel()
             if isinstance(window, Gtk.Window):
                 self._update_window(window)
@@ -239,7 +415,16 @@ class TitlebarChanger(plugin.MenuItem):
     # ── window-level CSS (TARGET_WINDOW) ──────────────────────────────────────
 
     def _get_window_override(self, window):
-        """Return the first matching override for any terminal in *window*."""
+        """Pick the override that drives the OS window title bar.
+
+        In follow-focus mode, only the focused terminal's override counts.
+        Otherwise the first matching pane in the window wins.
+        """
+        if self.window_follow_focus:
+            focused = self.focused_terminal.get(window)
+            if focused is None or focused not in self.watched:
+                return None
+            return self.terminal_override.get(focused)
         for terminal in self.watched:
             if terminal.get_toplevel() is window:
                 override = self.terminal_override.get(terminal)
@@ -361,10 +546,33 @@ class TitlebarChanger(plugin.MenuItem):
         except Exception as exc:
             err('TitlebarChanger: titlebar CSS load failed: %s' % exc)
 
+        # Inline modify_bg/modify_fg defeats Terminator's own modify_bg call
+        # in Titlebar.update(other=...).  CSS alone is invisible behind it.
+        self._apply_titlebar_modify(titlebar_widget, override)
+
     def _clear_all_titlebar_css(self):
         for provider in self.tb_provider.values():
             try:
                 provider.load_from_data(b'')
+            except Exception:
+                pass
+        # Also clear the inline overrides and let Terminator repaint its own
+        # colors via a focus-style update.
+        for terminal in list(self.watched):
+            tb = getattr(terminal, 'titlebar', None)
+            if tb is not None:
+                self._apply_titlebar_modify(tb, None)
+        try:
+            t = Terminator()
+            focused = t.get_focussed_terminal()
+        except Exception:
+            focused = None
+        for terminal in list(self.watched):
+            tb = getattr(terminal, 'titlebar', None)
+            if tb is None:
+                continue
+            try:
+                tb.update(focused if focused is not None else 'window-focus-out')
             except Exception:
                 pass
 
@@ -394,25 +602,44 @@ class TitlebarChanger(plugin.MenuItem):
                 dialog.set_transient_for(widget.get_toplevel())
             except Exception:
                 pass
-        dialog.set_default_size(720, 460)
+        dialog.set_default_size(720, 480)
 
-        # ── target selector ───────────────────────────────────────────────────
-        target_frame = Gtk.Frame(label=_(' Color target '))
-        target_box = Gtk.HBox(spacing=18)
+        # ── follow-profile toggle ─────────────────────────────────────────────
+        follow_cb = Gtk.CheckButton.new_with_mnemonic(
+            _('Titlebar follows active _profile '
+              '(rules below take priority and override profile colors)'))
+        follow_cb.set_active(self.follow_profile)
+        dialog.vbox.pack_start(follow_cb, False, False, 6)
+
+        # ── color targets (independent checkboxes) ────────────────────────────
+        target_frame = Gtk.Frame(label=_(' Color targets '))
+        target_box = Gtk.VBox(spacing=4)
         target_box.set_border_width(8)
 
-        rb_window   = Gtk.RadioButton.new_with_mnemonic(
-            None, _('_Window title bar  (OS-level CSD; any matching pane triggers it)'))
-        rb_titlebar = Gtk.RadioButton.new_with_mnemonic_from_widget(
-            rb_window, _('_Titlebar  (per-pane strip; each split reacts independently)'))
+        cb_titlebar = Gtk.CheckButton.new_with_mnemonic(
+            _('Per-pane _titlebar  (each split reacts independently)'))
+        cb_titlebar.set_active(self.target_titlebar)
+        target_box.pack_start(cb_titlebar, False, False, 0)
 
-        if self.target == TARGET_TITLEBAR:
-            rb_titlebar.set_active(True)
-        else:
-            rb_window.set_active(True)
+        cb_window = Gtk.CheckButton.new_with_mnemonic(
+            _('OS _window title bar  (CSD header bar)'))
+        cb_window.set_active(self.target_window)
+        target_box.pack_start(cb_window, False, False, 0)
 
-        target_box.pack_start(rb_window,   False, False, 0)
-        target_box.pack_start(rb_titlebar, False, False, 0)
+        focus_row = Gtk.HBox()
+        focus_row.pack_start(Gtk.Label(label='    '), False, False, 0)
+        cb_follow_focus = Gtk.CheckButton.new_with_mnemonic(
+            _('Window follows _focused pane '
+              '(otherwise: any matching pane in the window)'))
+        cb_follow_focus.set_active(self.window_follow_focus)
+        cb_follow_focus.set_sensitive(self.target_window)
+        focus_row.pack_start(cb_follow_focus, False, False, 0)
+        target_box.pack_start(focus_row, False, False, 0)
+
+        cb_window.connect(
+            'toggled',
+            lambda w: cb_follow_focus.set_sensitive(w.get_active()))
+
         target_frame.add(target_box)
         dialog.vbox.pack_start(target_frame, False, False, 6)
 
@@ -477,15 +704,19 @@ class TitlebarChanger(plugin.MenuItem):
             btn_box.pack_start(btn, False, False, 0)
         hbox.pack_start(btn_box, False, False, 0)
 
-        dialog.vbox.pack_start(hbox, True, True, 6)
+        rules_frame = Gtk.Frame(label=_(' Regex rules '))
+        rules_frame.add(hbox)
+        dialog.vbox.pack_start(rules_frame, True, True, 6)
 
         hint = Gtk.Label()
         hint.set_markup(_(
             '<small>'
-            'Regex matched against the VTE window title (set by your shell prompt).\n'
-            'First matching rule wins.  '
-            '<b>Titlebar</b>: colors each pane\'s own title strip independently.  '
-            '<b>Window</b>: colors the OS CSD header bar — any matching pane is enough.'
+            'Regex matched against the VTE window title (set by your shell prompt). '
+            'First matching rule wins.\n'
+            'Rules always have priority — when <b>follows active profile</b> is on, '
+            'the profile color is used only when no rule matches.\n'
+            '<b>Per-pane titlebar</b> and <b>window title bar</b> targets are '
+            'independent and can be enabled together.'
             '</small>'))
         hint.set_line_wrap(True)
         hint.set_xalign(0)
@@ -494,15 +725,23 @@ class TitlebarChanger(plugin.MenuItem):
         dialog.show_all()
 
         if dialog.run() == Gtk.ResponseType.ACCEPT:
-            new_target = TARGET_TITLEBAR if rb_titlebar.get_active() else TARGET_WINDOW
+            new_titlebar       = cb_titlebar.get_active()
+            new_window         = cb_window.get_active()
+            if not (new_titlebar or new_window):
+                new_window = True  # at least one target must be active
+            new_follow_focus = cb_follow_focus.get_active()
+            new_follow       = follow_cb.get_active()
 
-            # Clear stale CSS when switching modes.
-            if new_target != self.target:
-                if self.target == TARGET_WINDOW:
-                    self._clear_all_window_css()
-                else:
-                    self._clear_all_titlebar_css()
-                self.target = new_target
+            # Wipe stale CSS for any target being turned off.
+            if self.target_titlebar and not new_titlebar:
+                self._clear_all_titlebar_css()
+            if self.target_window and not new_window:
+                self._clear_all_window_css()
+
+            self.target_titlebar     = new_titlebar
+            self.target_window       = new_window
+            self.window_follow_focus = new_follow_focus
+            self.follow_profile      = new_follow
 
             self.rules = []
             it = store.get_iter_first()
