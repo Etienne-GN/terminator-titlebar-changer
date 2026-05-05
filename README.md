@@ -1,49 +1,56 @@
-# terminator-title-react
+# terminator-titlebar-changer
 
-A [Terminator](https://gnome-terminator.org/) plugin that colors the **OS window title bar** based on what is happening in the focused terminal — the same idea as [GNOME Console](https://gitlab.gnome.org/GNOME/console), which turns its header bar red for root sessions.
+A [Terminator](https://gnome-terminator.org/) plugin that colors a titlebar based on what is happening in a terminal pane — the same idea as [GNOME Console](https://gitlab.gnome.org/GNOME/console), which turns its header bar red for root sessions.
 
-Terminator's own per-pane titlebar is left completely untouched.
+Two coloring targets are available, switchable in the Preferences dialog:
 
-![example: red title bar for root session](https://raw.githubusercontent.com/Etienne-GN/terminator-title-react/main/docs/screenshot.png)
+| Target | What it colors | Split-pane aware? |
+|---|---|---|
+| **Titlebar** | The per-pane title strip at the top of each terminal split | Yes — each pane reacts independently |
+| **Window** | The OS-level CSD header bar for the whole window | No — but any matching pane is enough to trigger it |
 
 ---
 
 ## How it works
 
-Your shell sets the terminal window title via escape sequences (most distros do this by default in `~/.bashrc` or `~/.zshrc`). This plugin watches that title, matches it against your rules in order, and injects a GTK CSS override for the window's CSD decoration the moment a match is found. When no rule matches the title bar reverts to the theme default.
+Your shell sets the terminal window title via escape sequences (most distros do this by default in `~/.bashrc` or `~/.zshrc`). This plugin watches that title, matches it against your rules in order, and injects a GTK CSS override the moment a match is found. When no rule matches the colors revert to the theme default.
 
-> **Requires GTK3 client-side decorations (CSD).**  
-> This is the default on modern GNOME (X11 and Wayland). Has no visual effect under window managers that provide their own server-side decorations (SSD).
+> **Window target requires GTK3 client-side decorations (CSD).**  
+> This is the default on modern GNOME (X11 and Wayland). Has no visual effect under window managers that provide their own server-side decorations (SSD).  
+> The **Titlebar** target works regardless.
 
 ---
 
 ## Installation
 
 ```bash
-git clone git@github.com:Etienne-GN/terminator-title-react.git
-cd terminator-title-react
+git clone git@github.com:Etienne-GN/terminator-titlebar-changer.git
+cd terminator-titlebar-changer
 bash install.sh
 ```
 
 Then in Terminator:
 
-1. **Preferences → Plugins** → tick **TitleReact** → OK
+1. **Preferences → Plugins** → tick **TitlebarChanger** → OK
 2. Restart Terminator (or close and reopen the preferences dialog to reload plugins)
+
+> **Upgrading from terminator-title-react?**  
+> Your existing rules are automatically migrated on first load.
 
 ---
 
 ## Configuration
 
-Right-click anywhere in a terminal → **Title React → Preferences…**
+Right-click anywhere in a terminal → **Titlebar Changer → Preferences…**
 
-Each rule has:
+At the top of the dialog choose the **color target** (Titlebar or Window). Then manage your rules:
 
 | Field | Description |
 |---|---|
 | **Name** | A friendly label (for your reference only) |
 | **Regex Pattern** | Python `re` regex matched against the terminal window title |
-| **Title bar color** | Background color for the OS window title bar |
-| **Title text color** | Optional foreground (text + buttons) color override |
+| **BG color** | Background color |
+| **FG color** | Optional foreground (text) color override |
 | **Enabled** | Toggle a rule on/off without deleting it |
 
 Rules are evaluated top-to-bottom; **the first match wins**.
@@ -60,16 +67,7 @@ Most shells update the window title to something like `root@hostname:~` when you
 |---|---|---|---|
 | root | `root@` | `#cc0000` | `#ffffff` |
 
-> **Why not `\broot@`?**  
-> `\b` is a *word-boundary* anchor — it prevents matching `notroot@host`.  
-> In practice shell titles look like `root@host:path`, so a plain `root@` is enough.  
-> Use `\b` if you want to be extra safe against unusual hostnames or custom prompts.
-
 ### SSH connections
-
-```
-user@remote-host:~
-```
 
 | Name | Pattern | BG Color | FG Color |
 |---|---|---|---|
@@ -86,8 +84,6 @@ Matches any title containing `@something.something:` — a common SSH prompt sha
 | Docker | `\(docker\)` | `#154360` | `#d6eaf8` |
 
 ### Combining with your shell prompt
-
-If your `PS1` / `PROMPT_COMMAND` already embeds context markers in the title you can match on those directly:
 
 ```bash
 # In ~/.bashrc — set title to  [env] user@host:path

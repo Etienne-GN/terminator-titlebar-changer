@@ -1,28 +1,24 @@
-# Title React - Terminator plugin
-# Watches the terminal window title and reacts to regex matches by coloring the
-# OS-level window title bar (CSD / client-side decoration) — the same technique
-# used by GNOME Console to turn its header bar red for root sessions.
+# Titlebar Changer - Terminator plugin
+# Watches each terminal's window title and reacts to regex matches by coloring
+# either the per-pane Terminator titlebar or the OS-level window title bar.
 #
-# Terminator's own per-pane titlebar is left completely untouched.
-#
-# Configure via right-click menu:  Title React → Preferences…
+# Configure via right-click menu:  Titlebar Changer → Preferences…
 #
 # Each rule has:
 #   Name     – a friendly label for the rule
 #   Pattern  – a Python regex matched against the terminal window title
-#   BG Color – background color for the OS title bar  (e.g. #cc0000)
+#   BG Color – background color  (e.g. #cc0000)
 #   FG Color – optional text / button color override
 #   Enabled  – toggle on/off without deleting
 #
-# First matching rule wins.  When no rule matches the original title bar
-# color is restored.
+# Two color targets (chosen globally in Preferences):
+#   Titlebar  – colors the per-pane strip at the top of each terminal split;
+#               each pane reacts independently → works with split layouts
+#   Window    – colors the OS-level CSD header bar for the whole window;
+#               any pane matching a rule is enough to trigger the color change;
+#               requires GTK3 client-side decorations (default on modern GNOME)
 #
-# Example:
-#   Name=sudo   Pattern=\broot@   BG=#cc0000  FG=#ffffff
-#   → red title bar whenever the shell sets a title containing "root@"
-#
-# Requires GTK3 client-side decorations (CSD), which is the default on
-# modern GNOME.  Has no visual effect on SSD (window-manager decorations).
+# First matching rule wins.  When no rule matches the original colors are restored.
 
 import re
 
@@ -34,9 +30,12 @@ from terminatorlib.terminator import Terminator
 from terminatorlib.translation import _
 from terminatorlib.util import dbg, err
 
-AVAILABLE = ['TitleReact']
+AVAILABLE = ['TitlebarChanger']
 
 (COL_ENABLED, COL_NAME, COL_PATTERN, COL_BG, COL_FG) = range(5)
+
+TARGET_TITLEBAR = 'titlebar'
+TARGET_WINDOW   = 'window'
 
 # ─── colour helpers ──────────────────────────────────────────────────────────
 
@@ -54,7 +53,6 @@ def _hex_to_rgba(hex_str):
 
 
 def _darken(hex_str, factor=0.75):
-    """Return a darkened version of *hex_str* for the backdrop state."""
     rgba = _hex_to_rgba(hex_str)
     if rgba is None:
         return hex_str
@@ -67,46 +65,57 @@ def _darken(hex_str, factor=0.75):
 
 # ─── plugin ──────────────────────────────────────────────────────────────────
 
-class TitleReact(plugin.MenuItem):
-    """Color the OS window title bar based on regex rules matching the terminal title."""
+class TitlebarChanger(plugin.MenuItem):
+    """Color the per-pane titlebar or the OS window title bar based on regex rules."""
 
     capabilities = ['terminal_menu']
 
-    _class_serial = 0  # incremented per Gtk.Window to create a unique CSS class
+    _class_serial = 0  # incremented per widget to create a unique CSS class
 
     rules             = None  # list of rule dicts
+    target            = None  # TARGET_TITLEBAR or TARGET_WINDOW
     watched           = None  # set of Terminal objects
     handler_ids       = None  # Terminal → [(obj, signal_id), …]
     terminal_override = None  # Terminal → (bg_hex, fg_hex) | None
-    window_class      = None  # GtkWindow → str  (unique CSS class name added to it)
+    window_class      = None  # GtkWindow → str  (unique CSS class)
     window_provider   = None  # GtkWindow → Gtk.CssProvider
+    tb_class          = None  # Terminal → str  (unique CSS class for titlebar)
+    tb_provider       = None  # Terminal → Gtk.CssProvider
 
     def __init__(self):
         plugin.MenuItem.__init__(self)
         self.rules             = []
+        self.target            = TARGET_WINDOW
         self.watched           = set()
         self.handler_ids       = {}
         self.terminal_override = {}
         self.window_class      = {}
         self.window_provider   = {}
+        self.tb_class          = {}
+        self.tb_provider       = {}
         self._load_config()
         self._update_watched()
 
     def unload(self):
         for terminal in list(self.watched):
             self._unwatch_terminal(terminal)
-        # Clear all CSS providers so the title bars revert.
-        for provider in self.window_provider.values():
-            try:
-                provider.load_from_data(b'')
-            except Exception:
-                pass
+        self._clear_all_window_css()
+        self._clear_all_titlebar_css()
 
     # ── config ───────────────────────────────────────────────────────────────
 
     def _load_config(self):
         cfg = Config()
         sections = cfg.plugin_get_config(self.__class__.__name__)
+        # Migration: fall back to old plugin name if no config found yet
+        if not isinstance(sections, dict) or not sections:
+            old = cfg.plugin_get_config('TitleReact')
+            if isinstance(old, dict):
+                sections = old
+        self.target = TARGET_WINDOW
+        if isinstance(sections, dict):
+            t = sections.get('target', TARGET_WINDOW)
+            self.target = TARGET_TITLEBAR if t == TARGET_TITLEBAR else TARGET_WINDOW
         self.rules = []
         if not isinstance(sections, dict):
             return
@@ -128,11 +137,12 @@ class TitleReact(plugin.MenuItem):
                 'fg_color': item.get('fg_color', ''),
                 'enabled':  bool(item.get('enabled', True)),
             })
-        dbg('TitleReact: loaded %d rule(s)' % len(self.rules))
+        dbg('TitlebarChanger: loaded %d rule(s), target=%s' % (len(self.rules), self.target))
 
     def _save_config(self):
         cfg = Config()
         cfg.plugin_del_config(self.__class__.__name__)
+        cfg.plugin_set(self.__class__.__name__, 'target', self.target)
         for i, rule in enumerate(self.rules):
             cfg.plugin_set(self.__class__.__name__,
                            'rule_%d' % i,
@@ -164,7 +174,8 @@ class TitleReact(plugin.MenuItem):
         self.terminal_override[terminal] = None
 
         self._check_and_set(terminal, terminal.get_window_title() or '')
-        dbg('TitleReact: watching terminal %s' % terminal)
+        self._dispatch_update(terminal)
+        dbg('TitlebarChanger: watching terminal %s' % terminal)
 
     def _unwatch_terminal(self, terminal):
         for obj, hid in self.handler_ids.pop(terminal, []):
@@ -182,23 +193,23 @@ class TitleReact(plugin.MenuItem):
         self._check_and_set(terminal, title or '')
         new = self.terminal_override.get(terminal)
         if new != old:
-            self._maybe_update_window(terminal)
+            self._dispatch_update(terminal)
         return False
 
     def _on_focus_in(self, terminal, *_args):
-        # When this terminal gets focus, paint the window for its current state.
-        self._update_window_for(terminal)
+        if self.target == TARGET_WINDOW:
+            window = terminal.get_toplevel()
+            if isinstance(window, Gtk.Window):
+                self._update_window(window)
         return False
 
     def _on_focus_out(self, _terminal, _event, _data):
-        # Discover any terminals that were created while we weren't watching.
         GObject.idle_add(self._update_watched)
         return False
 
     # ── rule matching ─────────────────────────────────────────────────────────
 
     def _check_and_set(self, terminal, title):
-        """Match *title* against rules and store the result in terminal_override."""
         match = None
         for rule in self.rules:
             if not rule.get('enabled', True):
@@ -211,42 +222,45 @@ class TitleReact(plugin.MenuItem):
                     match = (rule['bg_color'], rule['fg_color'])
                     break
             except re.error as exc:
-                err('TitleReact: bad regex %r – %s' % (pattern, exc))
+                err('TitlebarChanger: bad regex %r – %s' % (pattern, exc))
         self.terminal_override[terminal] = match
 
-    def _maybe_update_window(self, terminal):
-        """Update the window only when *terminal* is the focused one."""
-        try:
-            focused = Terminator().last_focused_term
-        except Exception:
-            focused = None
-        if focused is terminal or focused is None:
-            self._update_window_for(terminal)
+    # ── dispatch ──────────────────────────────────────────────────────────────
 
-    def _update_window_for(self, terminal):
-        """Push the terminal's current override into the OS title bar CSS."""
-        window = terminal.get_toplevel()
-        if not isinstance(window, Gtk.Window):
-            return
-        self._apply_window_css(window, self.terminal_override.get(terminal))
+    def _dispatch_update(self, terminal):
+        """Route the update to the right target (titlebar or window)."""
+        if self.target == TARGET_TITLEBAR:
+            self._apply_titlebar_css(terminal, self.terminal_override.get(terminal))
+        else:
+            window = terminal.get_toplevel()
+            if isinstance(window, Gtk.Window):
+                self._update_window(window)
 
-    # ── CSS / window title bar ────────────────────────────────────────────────
+    # ── window-level CSS (TARGET_WINDOW) ──────────────────────────────────────
+
+    def _get_window_override(self, window):
+        """Return the first matching override for any terminal in *window*."""
+        for terminal in self.watched:
+            if terminal.get_toplevel() is window:
+                override = self.terminal_override.get(terminal)
+                if override is not None:
+                    return override
+        return None
+
+    def _update_window(self, window):
+        self._apply_window_css(window, self._get_window_override(window))
 
     def _ensure_window_class(self, window):
-        """Lazily attach a unique CSS class to *window* and return it."""
         if window not in self.window_class:
-            TitleReact._class_serial += 1
-            cls = 'title-react-%d' % TitleReact._class_serial
+            TitlebarChanger._class_serial += 1
+            cls = 'titlebar-changer-win-%d' % TitlebarChanger._class_serial
             window.get_style_context().add_class(cls)
             self.window_class[window] = cls
         return self.window_class[window]
 
     def _ensure_window_provider(self, window):
-        """Lazily create and register a CSS provider for *window*."""
         if window not in self.window_provider:
             provider = Gtk.CssProvider()
-            # Install at application priority on the screen so it affects the
-            # window's CSD decoration nodes.
             screen = window.get_screen() or Gdk.Screen.get_default()
             Gtk.StyleContext.add_provider_for_screen(
                 screen, provider,
@@ -261,24 +275,20 @@ class TitleReact(plugin.MenuItem):
         if override:
             bg_hex, fg_hex = override
             parts = []
-
             if bg_hex:
                 dark = _darken(bg_hex)
-                # Active (focused) window
                 parts.append(
                     'window.%(cls)s .titlebar,'
                     'window.%(cls)s headerbar {'
                     '  background-color: %(bg)s;'
                     '  background-image: none;'
                     '}' % {'cls': cls, 'bg': bg_hex})
-                # Backdrop (unfocused) — slightly darkened so it still reads well
                 parts.append(
                     'window.%(cls)s:backdrop .titlebar,'
                     'window.%(cls)s:backdrop headerbar {'
                     '  background-color: %(dark)s;'
                     '  background-image: none;'
                     '}' % {'cls': cls, 'dark': dark})
-
             if fg_hex:
                 parts.append(
                     'window.%(cls)s .titlebar *,'
@@ -290,21 +300,79 @@ class TitleReact(plugin.MenuItem):
                     'window.%(cls)s:backdrop headerbar * {'
                     '  color: mix(%(fg)s, #888888, 0.3);'
                     '}' % {'cls': cls, 'fg': fg_hex})
-
             css = '\n'.join(parts)
         else:
-            css = ''  # empty CSS → provider is a no-op → theme defaults restored
+            css = ''
 
         try:
             provider.load_from_data(css.encode())
         except Exception as exc:
-            err('TitleReact: CSS load failed: %s' % exc)
+            err('TitlebarChanger: window CSS load failed: %s' % exc)
+
+    def _clear_all_window_css(self):
+        for provider in self.window_provider.values():
+            try:
+                provider.load_from_data(b'')
+            except Exception:
+                pass
+
+    # ── per-pane titlebar CSS (TARGET_TITLEBAR) ───────────────────────────────
+
+    def _apply_titlebar_css(self, terminal, override):
+        titlebar_widget = getattr(terminal, 'titlebar', None)
+        if titlebar_widget is None:
+            return
+
+        if terminal not in self.tb_class:
+            TitlebarChanger._class_serial += 1
+            cls = 'titlebar-changer-tb-%d' % TitlebarChanger._class_serial
+            titlebar_widget.get_style_context().add_class(cls)
+            self.tb_class[terminal] = cls
+        cls = self.tb_class[terminal]
+
+        if terminal not in self.tb_provider:
+            provider = Gtk.CssProvider()
+            screen = titlebar_widget.get_screen() or Gdk.Screen.get_default()
+            # Priority 850 > APPLICATION (600) so we win over Terminator's own styling.
+            Gtk.StyleContext.add_provider_for_screen(screen, provider, 850)
+            self.tb_provider[terminal] = provider
+        provider = self.tb_provider[terminal]
+
+        if override:
+            bg_hex, fg_hex = override
+            parts = []
+            if bg_hex:
+                parts.append(
+                    '.%(cls)s {'
+                    '  background-color: %(bg)s;'
+                    '  background-image: none;'
+                    '}' % {'cls': cls, 'bg': bg_hex})
+            if fg_hex:
+                parts.append(
+                    '.%(cls)s label {'
+                    '  color: %(fg)s;'
+                    '}' % {'cls': cls, 'fg': fg_hex})
+            css = '\n'.join(parts)
+        else:
+            css = ''
+
+        try:
+            provider.load_from_data(css.encode())
+        except Exception as exc:
+            err('TitlebarChanger: titlebar CSS load failed: %s' % exc)
+
+    def _clear_all_titlebar_css(self):
+        for provider in self.tb_provider.values():
+            try:
+                provider.load_from_data(b'')
+            except Exception:
+                pass
 
     # ── context menu ──────────────────────────────────────────────────────────
 
     def callback(self, menuitems, _menu, _terminal):
         self._update_watched()
-        item = Gtk.MenuItem.new_with_mnemonic(_('_Title React'))
+        item = Gtk.MenuItem.new_with_mnemonic(_('_Titlebar Changer'))
         submenu = Gtk.Menu()
         item.set_submenu(submenu)
         prefs = Gtk.MenuItem.new_with_mnemonic(_('_Preferences…'))
@@ -316,7 +384,7 @@ class TitleReact(plugin.MenuItem):
 
     def configure(self, widget, _data=None):
         dialog = Gtk.Dialog(
-            _('Title React – Rules'),
+            _('Titlebar Changer – Rules'),
             None,
             Gtk.DialogFlags.MODAL,
             (_('_Cancel'), Gtk.ResponseType.REJECT,
@@ -326,8 +394,29 @@ class TitleReact(plugin.MenuItem):
                 dialog.set_transient_for(widget.get_toplevel())
             except Exception:
                 pass
-        dialog.set_default_size(720, 420)
+        dialog.set_default_size(720, 460)
 
+        # ── target selector ───────────────────────────────────────────────────
+        target_frame = Gtk.Frame(label=_(' Color target '))
+        target_box = Gtk.HBox(spacing=18)
+        target_box.set_border_width(8)
+
+        rb_window   = Gtk.RadioButton.new_with_mnemonic(
+            None, _('_Window title bar  (OS-level CSD; any matching pane triggers it)'))
+        rb_titlebar = Gtk.RadioButton.new_with_mnemonic_from_widget(
+            rb_window, _('_Titlebar  (per-pane strip; each split reacts independently)'))
+
+        if self.target == TARGET_TITLEBAR:
+            rb_titlebar.set_active(True)
+        else:
+            rb_window.set_active(True)
+
+        target_box.pack_start(rb_window,   False, False, 0)
+        target_box.pack_start(rb_titlebar, False, False, 0)
+        target_frame.add(target_box)
+        dialog.vbox.pack_start(target_frame, False, False, 6)
+
+        # ── rule list ─────────────────────────────────────────────────────────
         store = Gtk.ListStore(bool, str, str, str, str)
         for rule in self.rules:
             store.append([rule.get('enabled', True),
@@ -394,9 +483,9 @@ class TitleReact(plugin.MenuItem):
         hint.set_markup(_(
             '<small>'
             'Regex matched against the VTE window title (set by your shell prompt).\n'
-            'First matching rule wins. Colors the OS window title bar via GTK CSS '
-            '(requires CSD — the default on modern GNOME).\n'
-            'Double-click a row to edit its colors.'
+            'First matching rule wins.  '
+            '<b>Titlebar</b>: colors each pane\'s own title strip independently.  '
+            '<b>Window</b>: colors the OS CSD header bar — any matching pane is enough.'
             '</small>'))
         hint.set_line_wrap(True)
         hint.set_xalign(0)
@@ -405,6 +494,16 @@ class TitleReact(plugin.MenuItem):
         dialog.show_all()
 
         if dialog.run() == Gtk.ResponseType.ACCEPT:
+            new_target = TARGET_TITLEBAR if rb_titlebar.get_active() else TARGET_WINDOW
+
+            # Clear stale CSS when switching modes.
+            if new_target != self.target:
+                if self.target == TARGET_WINDOW:
+                    self._clear_all_window_css()
+                else:
+                    self._clear_all_titlebar_css()
+                self.target = new_target
+
             self.rules = []
             it = store.get_iter_first()
             while it is not None:
@@ -417,10 +516,11 @@ class TitleReact(plugin.MenuItem):
                 })
                 it = store.iter_next(it)
             self._save_config()
-            # Re-evaluate all terminals against the new rules.
+
+            # Re-evaluate all terminals against the new rules / target.
             for terminal in self.watched:
                 self._check_and_set(terminal, terminal.get_window_title() or '')
-                self._maybe_update_window(terminal)
+                self._dispatch_update(terminal)
 
         dialog.destroy()
 
@@ -499,7 +599,6 @@ class TitleReact(plugin.MenuItem):
     # ── add/edit rule dialog ──────────────────────────────────────────────────
 
     def _edit_rule_dialog(self, current, parent=None):
-        """Show an add/edit dialog for a single rule.  Returns a dict or None."""
         dialog = Gtk.Dialog(
             _('Edit Rule') if current else _('Add Rule'),
             parent,
@@ -540,8 +639,7 @@ class TitleReact(plugin.MenuItem):
         grid.attach(pat_entry, 1, row, 2, 1)
         row += 1
 
-        # BG color
-        grid.attach(_lbl(_('Title bar color:')), 0, row, 1, 1)
+        grid.attach(_lbl(_('BG color:')), 0, row, 1, 1)
         bg_init  = (current or {}).get('bg_color', '')
         bg_check = Gtk.CheckButton(label=_('Custom'))
         bg_check.set_active(bool(bg_init))
@@ -555,8 +653,7 @@ class TitleReact(plugin.MenuItem):
         grid.attach(bg_btn,   2, row, 1, 1)
         row += 1
 
-        # FG color
-        grid.attach(_lbl(_('Title text color:')), 0, row, 1, 1)
+        grid.attach(_lbl(_('FG color:')), 0, row, 1, 1)
         fg_init  = (current or {}).get('fg_color', '')
         fg_check = Gtk.CheckButton(label=_('Custom'))
         fg_check.set_active(bool(fg_init))
